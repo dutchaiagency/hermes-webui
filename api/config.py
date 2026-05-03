@@ -645,6 +645,68 @@ def _resolve_provider_alias(name: str) -> str:
     return _PROVIDER_ALIASES.get(raw, name)
 
 
+def _normalize_base_url_for_compare(base_url: str) -> str:
+    raw = str(base_url or "").strip().rstrip("/")
+    if not raw:
+        return ""
+    parsed = urlparse(raw if "://" in raw else f"http://{raw}")
+    if parsed.scheme and parsed.netloc:
+        return parsed._replace(
+            scheme=parsed.scheme.lower(),
+            netloc=parsed.netloc.lower(),
+            path=(parsed.path or "").rstrip("/"),
+            params="",
+            query="",
+            fragment="",
+        ).geturl()
+    return raw.lower()
+
+
+def _configured_provider_for_base_url(
+    base_url: str,
+    config_data: dict,
+    active_provider: str | None = None,
+) -> str:
+    target = _normalize_base_url_for_compare(base_url)
+    if not target or not isinstance(config_data, dict):
+        return ""
+
+    model_cfg = config_data.get("model", {})
+    if isinstance(model_cfg, dict):
+        model_base_url = _normalize_base_url_for_compare(model_cfg.get("base_url", ""))
+        if model_base_url == target:
+            owner = str(active_provider or model_cfg.get("provider") or "").strip()
+            if owner:
+                return _resolve_provider_alias(owner)
+
+    providers_cfg = config_data.get("providers", {})
+    if isinstance(providers_cfg, dict):
+        for provider_key, provider_cfg in providers_cfg.items():
+            if not isinstance(provider_cfg, dict):
+                continue
+            provider_base_url = _normalize_base_url_for_compare(
+                provider_cfg.get("base_url", "")
+            )
+            if provider_base_url != target:
+                continue
+            owner = str(provider_cfg.get("provider") or provider_key or "").strip()
+            if owner:
+                return _resolve_provider_alias(owner)
+
+    return ""
+
+
+def _fallback_provider_for_base_url(base_url: str) -> str:
+    parsed = urlparse(base_url if "://" in base_url else f"http://{base_url}")
+    host = (parsed.netloc or parsed.path or "").lower()
+    hostname = (parsed.hostname or "").lower()
+    if "ollama" in host or hostname in {"127.0.0.1", "::1", "localhost"}:
+        return "ollama"
+    if "lmstudio" in host or "lm-studio" in host:
+        return "lmstudio"
+    return "custom"
+
+
 # Well-known models per provider (used to populate dropdown for direct API providers)
 _PROVIDER_MODELS = {
     "anthropic": [
@@ -1799,58 +1861,6 @@ def get_available_models() -> dict:
                 if _pid_key in _PROVIDER_MODELS or _pid_key in cfg.get("providers", {}):
                     detected_providers.add(_pid_key)
 
-        def _normalize_base_url_for_match(value: object) -> str:
-            url = str(value or "").strip().rstrip("/")
-            if not url:
-                return ""
-            parsed_url = urlparse(url if "://" in url else f"http://{url}")
-            scheme = (parsed_url.scheme or "http").lower()
-            netloc = (parsed_url.netloc or parsed_url.path).lower().rstrip("/")
-            path = parsed_url.path.rstrip("/")
-            if not parsed_url.netloc:
-                path = ""
-            return f"{scheme}://{netloc}{path}"
-
-        def _configured_provider_for_base_url(base_url: object) -> str:
-            target = _normalize_base_url_for_match(base_url)
-            if not target:
-                return ""
-
-            if isinstance(model_cfg, dict):
-                model_base_url = _normalize_base_url_for_match(model_cfg.get("base_url"))
-                if model_base_url == target:
-                    provider_hint = _resolve_provider_alias(model_cfg.get("provider"))
-                    if provider_hint:
-                        return str(provider_hint).strip().lower()
-
-            providers_cfg = cfg.get("providers", {})
-            if isinstance(providers_cfg, dict):
-                for provider_key, provider_cfg in providers_cfg.items():
-                    if not isinstance(provider_cfg, dict):
-                        continue
-                    provider_base_url = _normalize_base_url_for_match(
-                        provider_cfg.get("base_url")
-                    )
-                    if provider_base_url == target:
-                        provider_hint = _resolve_provider_alias(provider_key)
-                        if provider_hint:
-                            return str(provider_hint).strip().lower()
-
-            custom_providers_cfg = cfg.get("custom_providers", [])
-            if isinstance(custom_providers_cfg, list):
-                for entry in custom_providers_cfg:
-                    if not isinstance(entry, dict):
-                        continue
-                    entry_base_url = _normalize_base_url_for_match(entry.get("base_url"))
-                    if entry_base_url != target:
-                        continue
-                    entry_name = str(entry.get("name") or "").strip()
-                    if entry_name:
-                        return "custom:" + entry_name.lower().replace(" ", "-")
-                    return "custom"
-
-            return ""
-
         # 4. Fetch models from custom endpoint if base_url is configured
         auto_detected_models = []
         auto_detected_models_by_provider: dict[str, list[dict]] = {}
@@ -1865,33 +1875,9 @@ def get_available_models() -> dict:
                 else:
                     endpoint_url = base_url.rstrip("/") + "/v1/models"
 
-                configured_provider = _configured_provider_for_base_url(base_url)
-                provider = configured_provider or "custom"
-                provider_from_config = bool(configured_provider)
-                parsed = urlparse(base_url if "://" in base_url else f"http://{base_url}")
-                host = (parsed.netloc or parsed.path).lower()
-
-                if parsed.hostname and not provider_from_config:
-                    try:
-                        addr = ipaddress.ip_address(parsed.hostname)
-                        if addr.is_private or addr.is_loopback or addr.is_link_local:
-                            if "ollama" in host or "127.0.0.1" in host or "localhost" in host:
-                                provider = "ollama"
-                            elif "lmstudio" in host or "lm-studio" in host:
-                                provider = "lmstudio"
-                            else:
-                                # Unknown loopback/private endpoint: route through
-                                # the generic ``custom`` provider so the agent's
-                                # auxiliary client (compression, vision, web
-                                # extraction) takes the OpenAI-compat custom path
-                                # with ``no-key-required`` semantics. Writing
-                                # ``provider: local`` here used to break
-                                # compression mid-conversation because ``local``
-                                # is not a registered provider in
-                                # ``hermes_cli.auth.PROVIDER_REGISTRY`` — see #1384.
-                                provider = "custom"
-                    except ValueError:
-                        pass
+                provider = _configured_provider_for_base_url(base_url, cfg, active_provider)
+                if not provider:
+                    provider = _fallback_provider_for_base_url(base_url)
 
                 headers = {}
                 api_key = ""
